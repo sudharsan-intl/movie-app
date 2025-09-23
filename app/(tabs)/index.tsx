@@ -1,23 +1,21 @@
-import { Button } from 'react-native-paper'
-import { Text, View } from '../../components/Themed'
-import { Alert } from 'react-native'
-
-export default function TabOneScreen() {
+import { View, Text } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
+export default function Home() {
   return (
-    <View className='flex-1 items-center justify-center border-2 border-cyan-200'>
-      <Text className='p-4 '>React Expo preconfigured with:</Text>
-      <Text className='pt-3'>Tailwinds (NativeWind)</Text>
-      <Text className='pt-3'>React Native Paper (Material UI)</Text>
-      <Text className='pt-3'>Prettier</Text>
-      <View lightColor='#eee' darkColor='rgba(255,255,255,0.1)' />
+   
+     
 
-      <Button
-        className='mt-20'
-        mode='contained'
-        onPress={() => Alert.alert('Paper button is working!')}
-      >
-        Paper button
-      </Button>
-    </View>
-  )
+  <LinearGradient
+      colors={["#000000", "#9333EA", "#312E81"]} // black → purple-500 → indigo-900
+      start={{ x: 0, y: 1 }}
+      end={{ x: 1, y: 0 }}
+      className="flex-1 items-center justify-center"
+    >
+      <Text className="text-white text-2xl">Gradient Background</Text>
+    </LinearGradient>
+
+     
+   
+  );
 }
+
