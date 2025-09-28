@@ -16,6 +16,11 @@ export default function RootLayout() {
         options={{headerShown:false}}
         />
 
+        <Stack.Screen 
+        name="products/[id]"
+        options={{headerShown:false}}
+        />
+
       </Stack>
              
   );
