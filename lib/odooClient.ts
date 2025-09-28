@@ -1,17 +1,4 @@
-import axios from "axios";
-
-const ODOO_URL = "https://happycolours.odoo.com";
-const DB = "happycolours";
-const LOGIN = "happycolours@uniflame.org";
-const API_KEY = "0e4bba0a6bc0c7ec21f6d9752885137d76dec53a";
-
-const client = axios.create({
-  baseURL: `${ODOO_URL}/jsonrpc`,
-  headers: {
-    "Content-Type": "application/json",
-  },
-  timeout: 15000,
-});
+import axios, { AxiosInstance } from "axios";
 
 type JsonRpcErrorData = {
   name?: string;
@@ -40,7 +27,7 @@ type ExecuteKwOptions = {
 };
 
 type DomainCondition = [string, string, unknown];
-type DomainOperator = '|' | '&' | '!';
+type DomainOperator = "|" | "&" | "!";
 type DomainClause = DomainCondition | DomainOperator;
 
 type SearchReadOptions = {
@@ -52,17 +39,49 @@ type SearchReadOptions = {
   context?: Record<string, unknown>;
 };
 
-let cachedUid: number | null = null;
-let rpcCounter = 0;
+type OdooCredentials = {
+  serverUrl: string;
+  database: string;
+  username: string;
+  password: string;
+};
+
+export type OdooUserProfile = {
+  id: number;
+  name: string;
+  email?: string;
+  partnerId?: number;
+  companyId?: number;
+};
+
+export type OdooSession = OdooCredentials & {
+  uid: number;
+  user: OdooUserProfile;
+};
+
 const DEFAULT_CONTEXT = { lang: "en_US" as const };
 const WRITE_CONTEXT = { lang: false as const };
+const KNOWN_ODOO_SUFFIXES = new Set(["odoo.com", "odoo.sh", "odoo.in", "odoo-online.com"]);
+const RESERVED_PATH_SEGMENTS = new Set(["web", "saas", "xmlrpc", "jsonrpc"]);
+const DEFAULT_TIMEOUT = 15000;
 
+type ExecuteKwSession = Pick<OdooSession, "database" | "uid" | "password">;
+
+let activeSession: OdooSession | null = null;
+let client: AxiosInstance | null = null;
+let rpcCounter = 0;
 
 const buildContext = (context?: Record<string, unknown>) => ({
   ...DEFAULT_CONTEXT,
   ...context,
 });
 
+const cleanObject = (input?: Record<string, unknown>) => {
+  if (!input) return {};
+  return Object.fromEntries(
+    Object.entries(input).filter(([, value]) => value !== undefined && value !== null)
+  );
+};
 
 const nextRpcId = () => {
   rpcCounter += 1;
@@ -75,60 +94,51 @@ const extractErrorMessage = (error?: JsonRpcError) => {
   return parts.filter(Boolean).join(" | ") || "Unknown Odoo error";
 };
 
-const authenticate = async (): Promise<number> => {
-  if (cachedUid) return cachedUid;
+const trimTrailingSlash = (value: string) => value.replace(/\/+$/, "");
 
-  const response = await client.post<
-    JsonRpcResponse<number>
-  >("", {
-    jsonrpc: "2.0",
-    method: "call",
-    params: {
-      service: "common",
-      method: "authenticate",
-      args: [DB, LOGIN, API_KEY, {}],
+const buildClient = (baseUrl: string) =>
+  axios.create({
+    baseURL: `${trimTrailingSlash(baseUrl)}/jsonrpc`,
+    headers: {
+      "Content-Type": "application/json",
     },
-    id: nextRpcId(),
+    timeout: DEFAULT_TIMEOUT,
   });
 
-  if (response.data.error) {
-    throw new Error(extractErrorMessage(response.data.error));
+const ensureSession = (): OdooSession => {
+  if (!activeSession) {
+    throw new Error("Not authenticated with Odoo. Please sign in again.");
   }
 
-  const uid = response.data.result;
-  if (typeof uid !== "number") {
-    throw new Error("Failed to authenticate with Odoo");
+  return activeSession;
+};
+
+const ensureClientAndSession = () => {
+  const session = ensureSession();
+  if (!client) {
+    client = buildClient(session.serverUrl);
   }
 
-  cachedUid = uid;
-  return uid;
+  return { client, session };
 };
 
-const cleanObject = (input?: Record<string, unknown>) => {
-  if (!input) return {};
-  return Object.fromEntries(
-    Object.entries(input).filter(([, value]) => value !== undefined && value !== null)
-  );
-};
-
-const executeKw = async <T>({ model, method, args = [], kwargs = {} }: ExecuteKwOptions): Promise<T> => {
-  const uid = await authenticate();
-
-  const response = await client.post<
-    JsonRpcResponse<T>
-  >("", {
+const executeKwWith = async <T>(
+  httpClient: AxiosInstance,
+  session: ExecuteKwSession,
+  { model, method, args = [], kwargs = {} }: ExecuteKwOptions
+): Promise<T> => {
+  const response = await httpClient.post<JsonRpcResponse<T>>("", {
     jsonrpc: "2.0",
     method: "call",
     params: {
       service: "object",
       method: "execute_kw",
-      args: [DB, uid, API_KEY, model, method, args, cleanObject(kwargs)],
+      args: [session.database, session.uid, session.password, model, method, args, cleanObject(kwargs)],
     },
     id: nextRpcId(),
   });
 
   if (response.data.error) {
-    cachedUid = null;
     throw new Error(extractErrorMessage(response.data.error));
   }
 
@@ -139,6 +149,11 @@ const executeKw = async <T>({ model, method, args = [], kwargs = {} }: ExecuteKw
   return response.data.result;
 };
 
+const executeKw = async <T>(options: ExecuteKwOptions): Promise<T> => {
+  const { client: httpClient, session } = ensureClientAndSession();
+  return executeKwWith(httpClient, session, options);
+};
+
 const executeSearchRead = async <T>({
   model,
   domain = [],
@@ -147,13 +162,304 @@ const executeSearchRead = async <T>({
   order,
   context,
 }: SearchReadOptions): Promise<T> => {
-    return executeKw<T>({
+  return executeKw<T>({
     model,
     method: "search_read",
     args: [domain],
     kwargs: cleanObject({ fields, limit, order, context: buildContext(context) }),
   });
 };
+
+const ensureProtocol = (value: string) => (/^https?:\/\//i.test(value) ? value : `https://${value}`);
+
+type ParsedInputUrl = {
+  protocol: "http" | "https";
+  host: string;
+  path: string;
+  query: string;
+  hash: string;
+};
+
+const parseInputUrl = (value: string): ParsedInputUrl | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized = ensureProtocol(trimmed);
+  const match = normalized.match(/^(https?):\/\/([^\/?#]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const protocol = match[1].toLowerCase() as "http" | "https";
+  const host = match[2];
+  const path = match[3] ?? "";
+  const query = match[4] ?? "";
+  const hash = match[5] ?? "";
+  return { protocol, host, path, query, hash };
+};
+
+const normalizePath = (path: string) => {
+  if (!path) return "";
+
+  const trimmedPath = path.trim();
+  if (!trimmedPath) return "";
+
+  const normalized = trimmedPath.replace(/\/+/g, "/");
+  const withoutTrailing = normalized.replace(/\/+$/, "");
+  const segments = withoutTrailing.split("/").filter(Boolean);
+  return segments.length > 0 ? `/${segments.join("/")}` : "";
+};
+
+const safeDecode = (value: string) => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+const parseParams = (segment: string): Record<string, string> => {
+  if (!segment) return {};
+  const clean = segment.replace(/^[?#]/, "");
+  if (!clean) return {};
+
+  return clean.split(/[&;]/).reduce<Record<string, string>>((acc, pair) => {
+    if (!pair) return acc;
+    const [rawKey, rawValue = ""] = pair.split("=");
+    const key = safeDecode(rawKey.trim());
+    if (!key) return acc;
+    const value = safeDecode(rawValue.replace(/\+/g, " "));
+    acc[key] = value;
+    return acc;
+  }, {});
+};
+
+const normalizeServerUrl = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error("Server address is required.");
+  }
+
+  const parsed = parseInputUrl(trimmed);
+  if (!parsed) {
+    throw new Error("Invalid server address.");
+  }
+
+  const path = normalizePath(parsed.path);
+  return `${parsed.protocol}://${parsed.host}${path}`;
+};
+
+const extractDatabaseFromUrl = (raw: string): string | undefined => {
+  const parsed = parseInputUrl(raw);
+  if (!parsed) {
+    return undefined;
+  }
+
+  const queryParams = parseParams(parsed.query);
+  const fromQuery = queryParams.db?.trim();
+  if (fromQuery) {
+    return fromQuery;
+  }
+
+  const hashParams = parseParams(parsed.hash);
+  const fromHash = hashParams.db?.trim();
+  if (fromHash) {
+    return fromHash;
+  }
+
+  const hashValue = parsed.hash.replace(/^#/, "").trim();
+  if (!fromHash && hashValue && !hashValue.includes("=") && !hashValue.includes("&")) {
+    return hashValue;
+  }
+
+  const pathSegments = normalizePath(parsed.path).split("/").filter(Boolean);
+  if (pathSegments.length === 1) {
+    const candidate = pathSegments[0];
+    if (!RESERVED_PATH_SEGMENTS.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+
+  const hostSegments = parsed.host.split(".").filter(Boolean);
+  if (hostSegments.length >= 2) {
+    const suffix = hostSegments.slice(-2).join(".");
+    if (KNOWN_ODOO_SUFFIXES.has(suffix) || hostSegments.length > 2) {
+      const candidate = hostSegments[0];
+      if (candidate && candidate.toLowerCase() !== "www") {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+};
+const discoverDatabase = async (httpClient: AxiosInstance): Promise<string | undefined> => {
+  try {
+    const response = await httpClient.post<JsonRpcResponse<string[]>>("", {
+      jsonrpc: "2.0",
+      method: "call",
+      params: {
+        service: "db",
+        method: "list",
+        args: [],
+      },
+      id: nextRpcId(),
+    });
+
+    if (response.data.error) {
+      return undefined;
+    }
+
+    const databases = response.data.result;
+    if (Array.isArray(databases) && databases.length === 1 && typeof databases[0] === "string") {
+      return databases[0];
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+};
+
+const authenticateWithClient = async (
+  httpClient: AxiosInstance,
+  { database, username, password }: { database: string; username: string; password: string }
+): Promise<number> => {
+  const db = database.trim();
+  const login = username.trim();
+
+  if (!db) {
+    throw new Error("Database is required.");
+  }
+
+  if (!login) {
+    throw new Error("Username or email is required.");
+  }
+
+  if (!password) {
+    throw new Error("Password is required.");
+  }
+
+  const response = await httpClient.post<JsonRpcResponse<number>>("", {
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "common",
+      method: "authenticate",
+      args: [db, login, password, {}],
+    },
+    id: nextRpcId(),
+  });
+
+  if (response.data.error) {
+    throw new Error(extractErrorMessage(response.data.error));
+  }
+
+  const uid = response.data.result;
+  if (typeof uid !== "number" || !Number.isInteger(uid)) {
+    throw new Error("Invalid login response from Odoo");
+  }
+
+  return uid;
+};
+
+export type SignInParams = {
+  serverUrl: string;
+  username: string;
+  password: string;
+  database?: string;
+};
+
+export type SignInResult = {
+  session: OdooSession;
+  user: OdooUserProfile;
+};
+
+export const signInToOdoo = async ({
+  serverUrl,
+  username,
+  password,
+  database,
+}: SignInParams): Promise<SignInResult> => {
+  const normalizedServerUrl = normalizeServerUrl(serverUrl);
+  const httpClient = buildClient(normalizedServerUrl);
+  const login = username.trim();
+
+  const resolvedDatabase = (database && database.trim())
+    || extractDatabaseFromUrl(serverUrl)
+    || (await discoverDatabase(httpClient));
+
+  if (!resolvedDatabase) {
+    throw new Error("Could not determine the Odoo database. Please provide it in the advanced settings.");
+  }
+
+  const uid = await authenticateWithClient(httpClient, {
+    database: resolvedDatabase,
+    username: login,
+    password,
+  });
+
+  const userRecords = await executeKwWith<Record<string, unknown>[]>(
+    httpClient,
+    { database: resolvedDatabase, uid, password },
+    {
+      model: "res.users",
+      method: "read",
+      args: [[uid]],
+      kwargs: {
+        fields: ["name", "email", "login", "partner_id", "company_id"],
+        context: buildContext(),
+      },
+    }
+  );
+
+  const rawUser = Array.isArray(userRecords) && userRecords.length > 0 ? userRecords[0] : {};
+  const partnerIdRaw = Array.isArray((rawUser as Record<string, unknown>).partner_id)
+    ? (rawUser as Record<string, unknown>).partner_id?.[0]
+    : undefined;
+  const companyIdRaw = Array.isArray((rawUser as Record<string, unknown>).company_id)
+    ? (rawUser as Record<string, unknown>).company_id?.[0]
+    : undefined;
+
+  const profile: OdooUserProfile = {
+    id: uid,
+    name:
+      typeof (rawUser as Record<string, unknown>).name === "string" && ((rawUser as Record<string, unknown>).name as string).trim().length > 0
+        ? ((rawUser as Record<string, unknown>).name as string).trim()
+        : login,
+    email:
+      typeof (rawUser as Record<string, unknown>).email === "string" && ((rawUser as Record<string, unknown>).email as string).trim().length > 0
+        ? ((rawUser as Record<string, unknown>).email as string).trim()
+        : typeof (rawUser as Record<string, unknown>).login === "string"
+          ? ((rawUser as Record<string, unknown>).login as string).trim()
+          : undefined,
+    partnerId: Number.isInteger(partnerIdRaw) ? Number(partnerIdRaw) : undefined,
+    companyId: Number.isInteger(companyIdRaw) ? Number(companyIdRaw) : undefined,
+  };
+
+  const sessionData: OdooSession = {
+    serverUrl: normalizedServerUrl,
+    database: resolvedDatabase,
+    username: login,
+    password,
+    uid,
+    user: profile,
+  };
+
+  activeSession = sessionData;
+  client = httpClient;
+
+  return { session: sessionData, user: profile };
+};
+
+export const signOutFromOdoo = () => {
+  activeSession = null;
+  client = null;
+};
+
+export const getActiveSession = () => activeSession;
 
 export type OdooMovieRecord = {
   id: number;
@@ -256,7 +562,14 @@ export const fetchProductTemplates = async (
   return Array.isArray(records) ? records : [];
 };
 
-type ProductTemplateUpdatableField = "name" | "list_price" | "description_sale" | "sale_ok" | "active" | "default_code" | "image_1920";
+type ProductTemplateUpdatableField =
+  | "name"
+  | "list_price"
+  | "description_sale"
+  | "sale_ok"
+  | "active"
+  | "default_code"
+  | "image_1920";
 
 export type UpdateProductTemplateInput = Partial<Pick<OdooProductTemplate, ProductTemplateUpdatableField>>;
 
@@ -379,9 +692,7 @@ export const updateProductTemplate = async (
       const variantIds = await executeKw<number[]>({
         model: "product.product",
         method: "search",
-        args: [[
-          ["product_tmpl_id", "=", id],
-        ]],
+        args: [[["product_tmpl_id", "=", id]]],
       });
 
       if (Array.isArray(variantIds) && variantIds.length > 0) {
@@ -420,7 +731,6 @@ export const deleteProductTemplates = async (ids: number | number[]): Promise<bo
   return !!result;
 };
 
-
 export const searchProductTemplates = async (
   query: string,
   options: Omit<FetchProductTemplatesOptions, "search"> = {}
@@ -433,28 +743,57 @@ export const searchProductTemplates = async (
 };
 
 
+export type OdooMenuEntry = {
+  id: number;
+  name: string;
+  web_icon_data?: string | false;
+  action?: string | false;
+  sequence?: number;
+  parent_id?: [number, string] | false;
+};
 
+const MENU_FIELDS = ["name", "web_icon_data", "action", "sequence", "parent_id"] as const;
 
+const normalizeMenuRecords = (records: unknown): OdooMenuEntry[] => {
+  if (!Array.isArray(records)) return [];
+  return records.filter((entry): entry is OdooMenuEntry => {
+    if (!entry || typeof entry !== "object") return false;
+    return typeof (entry as { id?: unknown }).id === "number" && typeof (entry as { name?: unknown }).name === "string";
+  });
+};
 
+export const fetchRootMenus = async (): Promise<OdooMenuEntry[]> => {
+  const domain: DomainClause[] = [
+    ["parent_id", "=", false],
+    ["action", "!=", false],
+  ];
 
+  const records = await executeSearchRead<OdooMenuEntry[]>({
+    model: "ir.ui.menu",
+    domain,
+    fields: [...MENU_FIELDS],
+    order: "sequence asc",
+  });
 
+  return normalizeMenuRecords(records);
+};
 
+export const fetchChildMenus = async (parentId: number): Promise<OdooMenuEntry[]> => {
+  if (!Number.isInteger(parentId)) {
+    return [];
+  }
 
+  const domain: DomainClause[] = [
+    ["parent_id", "=", parentId],
+    ["action", "!=", false],
+  ];
 
+  const records = await executeSearchRead<OdooMenuEntry[]>({
+    model: "ir.ui.menu",
+    domain,
+    fields: [...MENU_FIELDS],
+    order: "sequence asc",
+  });
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+  return normalizeMenuRecords(records);
+};

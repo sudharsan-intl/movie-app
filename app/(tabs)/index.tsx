@@ -16,6 +16,7 @@ import { useRouter, useNavigation } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import { fetchProductTemplates, type OdooProductTemplate } from "../../lib/odooClient";
+import { useAuth } from "../../lib/auth";
 
 const LogoBadge = () => (
   <LinearGradient
@@ -70,6 +71,7 @@ const getImageSource = (record: Partial<OdooProductTemplate>) => {
 };
 
 export default function Index() {
+  const { session } = useAuth();
   const router = useRouter();
   const navigation = useNavigation();
   const isFocused = useIsFocused();
@@ -105,6 +107,11 @@ export default function Index() {
       }
     }
   }, []);
+
+  const handlePortalNav = useCallback(() => {
+    router.push('/portal');
+  }, [router]);
+
 
   useEffect(() => {
     let isMounted = true;
@@ -218,9 +225,15 @@ export default function Index() {
 
       <View className="flex-1 px-6">
         <View className="items-center pt-[72px]">
-          <LogoBadge />
+          <TouchableOpacity
+            onPress={handlePortalNav}
+            accessibilityRole="link"
+            accessibilityLabel="Open Odoo workspace"
+            activeOpacity={0.8}
+          >
+            <LogoBadge />
+          </TouchableOpacity>
         </View>
-
         <View className="mt-16 flex-row items-center gap-3">
           <Ionicons name="search" size={20} color="rgba(255,255,255,0.85)" />
           <TextInput
